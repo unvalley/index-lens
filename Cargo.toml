@@ -1,6 +1,6 @@
 [package]
-name = "index_lens"
-version = "0.1.0"
+name = "sdx"
+version = "0.0.1"
 edition = "2024"
 
 [dependencies]
