@@ -2,17 +2,20 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    Tabs,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -20,25 +23,64 @@ use serde_json::Value;
 struct ClusterHealth {
     cluster_name: String,
     status: String,
-    number_of_nodes: u64,
-    active_primary_shards: u64,
-    active_shards: u64,
-    unassigned_shards: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct IndexEntry {
     health: String,
-    status: String,
     #[serde(rename = "index")]
     name: String,
     #[serde(rename = "docs.count")]
     docs_count: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+struct AliasEntry {
+    alias: String,
+    #[serde(rename = "index")]
+    index_name: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct DataStreamResponse {
+    #[serde(default)]
+    data_streams: Vec<DataStreamEntry>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct DataStreamEntry {
+    name: String,
+    status: Option<String>,
+    generation: Option<u64>,
+    indices: Option<Vec<DataStreamIndex>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct DataStreamIndex {
+    #[serde(rename = "index_name")]
+    #[allow(dead_code)]
+    name: String,
+}
+
+#[derive(Debug, Clone)]
+struct SavedView {
+    name: String,
+    scope: String,
+    query: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
+    took: Option<u64>,
+    timed_out: Option<bool>,
+    #[serde(rename = "_shards")]
+    shards: Option<SearchShards>,
     hits: SearchHits,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchShards {
+    failed: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,23 +109,38 @@ struct DocEntry {
 }
 
 #[derive(Debug, Clone)]
-struct IndexDetails {
-    name: String,
-    uuid: Option<String>,
-    shards: Option<String>,
-    replicas: Option<String>,
+struct SearchSummary {
+    total: Option<u64>,
+    took: Option<u64>,
+    shards_failed: Option<u64>,
+    timed_out: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Focus {
-    Indices,
-    Docs,
+    LeftNav,
+    Results,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum InputMode {
     Normal,
     Query,
+    ScopeFilter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScopeKind {
+    Indices,
+    Aliases,
+    DataStreams,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DocViewMode {
+    Pretty,
+    Raw,
+    Flatten,
 }
 
 struct App {
@@ -91,17 +148,30 @@ struct App {
     client: reqwest::blocking::Client,
     health: Option<ClusterHealth>,
     indices: Vec<IndexEntry>,
+    aliases: Vec<AliasEntry>,
+    datastreams: Vec<DataStreamEntry>,
+    favorites: Vec<String>,
+    saved_views: Vec<SavedView>,
     documents: Vec<DocEntry>,
     docs_total: Option<u64>,
     docs_from: u64,
     docs_size: u64,
-    index_details: Option<IndexDetails>,
     indices_state: ListState,
-    docs_state: ListState,
+    aliases_state: ListState,
+    datastreams_state: ListState,
+    docs_state: TableState,
     focus: Focus,
     input_mode: InputMode,
+    scope_kind: ScopeKind,
+    scope_filter: String,
+    scope_filter_edit: String,
     query: String,
     query_edit: String,
+    show_doc_drawer: bool,
+    doc_view_mode: DocViewMode,
+    search_took_ms: Option<u64>,
+    search_shards_failed: Option<u64>,
+    search_timed_out: Option<bool>,
     last_error: Option<String>,
     last_fetch: Option<Instant>,
 }
@@ -114,59 +184,100 @@ impl App {
             .expect("failed to build http client");
         let mut indices_state = ListState::default();
         indices_state.select(None);
-        let mut docs_state = ListState::default();
+        let mut aliases_state = ListState::default();
+        aliases_state.select(None);
+        let mut datastreams_state = ListState::default();
+        datastreams_state.select(None);
+        let mut docs_state = TableState::default();
         docs_state.select(None);
         Self {
             es_url,
             client,
             health: None,
             indices: Vec::new(),
+            aliases: Vec::new(),
+            datastreams: Vec::new(),
+            favorites: Vec::new(),
+            saved_views: Vec::new(),
             documents: Vec::new(),
             docs_total: None,
             docs_from: 0,
             docs_size: 5,
-            index_details: None,
             indices_state,
+            aliases_state,
+            datastreams_state,
             docs_state,
-            focus: Focus::Indices,
+            focus: Focus::LeftNav,
             input_mode: InputMode::Normal,
+            scope_kind: ScopeKind::Indices,
+            scope_filter: String::new(),
+            scope_filter_edit: String::new(),
             query: String::new(),
             query_edit: String::new(),
+            show_doc_drawer: false,
+            doc_view_mode: DocViewMode::Pretty,
+            search_took_ms: None,
+            search_shards_failed: None,
+            search_timed_out: None,
             last_error: None,
             last_fetch: None,
         }
     }
 
-    fn selected_index_name(&self) -> Option<&str> {
-        self.indices_state
-            .selected()
-            .and_then(|idx| self.indices.get(idx))
-            .map(|entry| entry.name.as_str())
+    fn selected_scope_name(&self) -> Option<&str> {
+        match self.scope_kind {
+            ScopeKind::Indices => self
+                .indices_state
+                .selected()
+                .and_then(|idx| self.indices.get(idx))
+                .map(|entry| entry.name.as_str()),
+            ScopeKind::Aliases => self
+                .aliases_state
+                .selected()
+                .and_then(|idx| self.aliases.get(idx))
+                .map(|entry| entry.alias.as_str()),
+            ScopeKind::DataStreams => self
+                .datastreams_state
+                .selected()
+                .and_then(|idx| self.datastreams.get(idx))
+                .map(|entry| entry.name.as_str()),
+        }
     }
 
-    fn select_next(&mut self) {
-        if self.indices.is_empty() {
-            self.indices_state.select(None);
+    fn set_scope_kind(&mut self, scope: ScopeKind) {
+        if self.scope_kind == scope {
             return;
         }
-        let next = match self.indices_state.selected() {
-            Some(idx) if idx + 1 < self.indices.len() => idx + 1,
-            _ => 0,
-        };
-        self.indices_state.select(Some(next));
+        self.scope_kind = scope;
         self.reset_docs_paging();
     }
 
-    fn select_prev(&mut self) {
-        if self.indices.is_empty() {
-            self.indices_state.select(None);
+    fn select_next_scope_item(&mut self) {
+        self.shift_scope_selection(1);
+    }
+
+    fn select_prev_scope_item(&mut self) {
+        self.shift_scope_selection(-1);
+    }
+
+    fn shift_scope_selection(&mut self, delta: isize) {
+        let filtered = self.filtered_scope_indices();
+        if filtered.is_empty() {
+            self.set_scope_selected(None);
             return;
         }
-        let prev = match self.indices_state.selected() {
-            Some(0) | None => self.indices.len() - 1,
-            Some(idx) => idx - 1,
+        let current = self.scope_selected();
+        let current_pos = current
+            .and_then(|idx| filtered.iter().position(|value| *value == idx))
+            .unwrap_or(0);
+        let next_pos = if delta >= 0 {
+            (current_pos + 1) % filtered.len()
+        } else if current_pos == 0 {
+            filtered.len() - 1
+        } else {
+            current_pos - 1
         };
-        self.indices_state.select(Some(prev));
+        self.set_scope_selected(Some(filtered[next_pos]));
         self.reset_docs_paging();
     }
 
@@ -217,6 +328,51 @@ impl App {
             self.docs_from = 0;
         }
     }
+
+    fn scope_selected(&self) -> Option<usize> {
+        match self.scope_kind {
+            ScopeKind::Indices => self.indices_state.selected(),
+            ScopeKind::Aliases => self.aliases_state.selected(),
+            ScopeKind::DataStreams => self.datastreams_state.selected(),
+        }
+    }
+
+    fn set_scope_selected(&mut self, idx: Option<usize>) {
+        match self.scope_kind {
+            ScopeKind::Indices => self.indices_state.select(idx),
+            ScopeKind::Aliases => self.aliases_state.select(idx),
+            ScopeKind::DataStreams => self.datastreams_state.select(idx),
+        }
+    }
+
+    fn filtered_scope_indices(&self) -> Vec<usize> {
+        let needle = self.scope_filter.trim().to_lowercase();
+        match self.scope_kind {
+            ScopeKind::Indices => filter_indices_by(&self.indices, &needle, |entry| &entry.name),
+            ScopeKind::Aliases => filter_indices_by(&self.aliases, &needle, |entry| &entry.alias),
+            ScopeKind::DataStreams => {
+                filter_indices_by(&self.datastreams, &needle, |entry| &entry.name)
+            }
+        }
+    }
+
+    fn ensure_scope_selection_visible(&mut self) -> bool {
+        let filtered = self.filtered_scope_indices();
+        if filtered.is_empty() {
+            if self.scope_selected().is_some() {
+                self.set_scope_selected(None);
+                return true;
+            }
+            return false;
+        }
+        if let Some(current) = self.scope_selected() {
+            if filtered.iter().any(|idx| *idx == current) {
+                return false;
+            }
+        }
+        self.set_scope_selected(Some(filtered[0]));
+        true
+    }
 }
 
 fn main() -> Result<()> {
@@ -263,29 +419,53 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) 
                             app.input_mode = InputMode::Query;
                             app.query_edit = app.query.clone();
                         }
+                        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.input_mode = InputMode::ScopeFilter;
+                            app.scope_filter_edit = app.scope_filter.clone();
+                        }
                         KeyCode::Tab => {
                             app.focus = match app.focus {
-                                Focus::Indices => Focus::Docs,
-                                Focus::Docs => Focus::Indices,
+                                Focus::LeftNav => Focus::Results,
+                                Focus::Results => Focus::LeftNav,
                             };
                         }
+                        KeyCode::Char('1') => {
+                            app.set_scope_kind(ScopeKind::Indices);
+                            handle_scope_change(&mut app);
+                        }
+                        KeyCode::Char('2') => {
+                            app.set_scope_kind(ScopeKind::Aliases);
+                            handle_scope_change(&mut app);
+                        }
+                        KeyCode::Char('3') => {
+                            app.set_scope_kind(ScopeKind::DataStreams);
+                            handle_scope_change(&mut app);
+                        }
                         KeyCode::Up => match app.focus {
-                            Focus::Indices => {
-                                app.select_prev();
-                                handle_index_change(&mut app);
+                            Focus::LeftNav => {
+                                app.select_prev_scope_item();
+                                handle_scope_change(&mut app);
                             }
-                            Focus::Docs => app.select_prev_doc(),
+                            Focus::Results => app.select_prev_doc(),
                         },
                         KeyCode::Down => match app.focus {
-                            Focus::Indices => {
-                                app.select_next();
-                                handle_index_change(&mut app);
+                            Focus::LeftNav => {
+                                app.select_next_scope_item();
+                                handle_scope_change(&mut app);
                             }
-                            Focus::Docs => app.select_next_doc(),
+                            Focus::Results => app.select_next_doc(),
                         },
-                        KeyCode::Enter | KeyCode::Char('d') => {
-                            handle_docs_refresh(&mut app);
+                        KeyCode::Enter | KeyCode::Char('o') => {
+                            if app.focus == Focus::Results {
+                                app.show_doc_drawer = !app.show_doc_drawer;
+                            }
                         }
+                        KeyCode::Esc => {
+                            if app.show_doc_drawer {
+                                app.show_doc_drawer = false;
+                            }
+                        }
+                        KeyCode::Char('d') => handle_docs_refresh(&mut app),
                         KeyCode::Char('n') => {
                             app.next_docs_page();
                             handle_docs_refresh(&mut app);
@@ -293,6 +473,15 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) 
                         KeyCode::Char('p') => {
                             app.prev_docs_page();
                             handle_docs_refresh(&mut app);
+                        }
+                        KeyCode::Char('v') => {
+                            if app.show_doc_drawer {
+                                app.doc_view_mode = match app.doc_view_mode {
+                                    DocViewMode::Pretty => DocViewMode::Raw,
+                                    DocViewMode::Raw => DocViewMode::Flatten,
+                                    DocViewMode::Flatten => DocViewMode::Pretty,
+                                };
+                            }
                         }
                         _ => {}
                     },
@@ -312,6 +501,32 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) 
                         }
                         KeyCode::Char(ch) => {
                             app.query_edit.push(ch);
+                        }
+                        _ => {}
+                    },
+                    InputMode::ScopeFilter => match key.code {
+                        KeyCode::Esc => {
+                            app.scope_filter_edit.clear();
+                            app.scope_filter.clear();
+                            app.input_mode = InputMode::Normal;
+                            if app.ensure_scope_selection_visible() {
+                                handle_scope_change(&mut app);
+                            }
+                        }
+                        KeyCode::Enter => {
+                            app.scope_filter = app.scope_filter_edit.trim().to_string();
+                            app.input_mode = InputMode::Normal;
+                            if app.ensure_scope_selection_visible() {
+                                handle_scope_change(&mut app);
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            app.scope_filter_edit.pop();
+                            app.scope_filter = app.scope_filter_edit.clone();
+                        }
+                        KeyCode::Char(ch) => {
+                            app.scope_filter_edit.push(ch);
+                            app.scope_filter = app.scope_filter_edit.clone();
                         }
                         _ => {}
                     },
@@ -339,8 +554,11 @@ fn refresh_all(app: &mut App) {
     if let Err(err) = refresh_indices(app) {
         errors.push(format!("indices: {err:#}"));
     }
-    if let Err(err) = refresh_index_details(app) {
-        errors.push(format!("details: {err:#}"));
+    if let Err(err) = refresh_aliases(app) {
+        errors.push(format!("aliases: {err:#}"));
+    }
+    if let Err(err) = refresh_datastreams(app) {
+        errors.push(format!("datastreams: {err:#}"));
     }
     if let Err(err) = refresh_docs(app) {
         errors.push(format!("docs: {err:#}"));
@@ -361,7 +579,11 @@ fn refresh_health(app: &mut App) -> Result<()> {
 }
 
 fn refresh_indices(app: &mut App) -> Result<()> {
-    let selected_name = app.selected_index_name().map(|name| name.to_string());
+    let selected_name = app
+        .indices_state
+        .selected()
+        .and_then(|idx| app.indices.get(idx))
+        .map(|entry| entry.name.to_string());
     let indices = fetch_indices(&app.client, &app.es_url)?;
     app.indices = indices;
 
@@ -380,23 +602,77 @@ fn refresh_indices(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+fn refresh_aliases(app: &mut App) -> Result<()> {
+    let selected_name = app
+        .aliases_state
+        .selected()
+        .and_then(|idx| app.aliases.get(idx))
+        .map(|entry| entry.alias.to_string());
+    let aliases = fetch_aliases(&app.client, &app.es_url)?;
+    app.aliases = aliases;
+
+    let next_selected = if let Some(name) = selected_name {
+        app.aliases.iter().position(|entry| entry.alias == name)
+    } else {
+        None
+    };
+    if app.aliases.is_empty() {
+        app.aliases_state.select(None);
+    } else if let Some(idx) = next_selected {
+        app.aliases_state.select(Some(idx));
+    } else {
+        app.aliases_state.select(Some(0));
+    }
+    Ok(())
+}
+
+fn refresh_datastreams(app: &mut App) -> Result<()> {
+    let selected_name = app
+        .datastreams_state
+        .selected()
+        .and_then(|idx| app.datastreams.get(idx))
+        .map(|entry| entry.name.to_string());
+    let datastreams = fetch_datastreams(&app.client, &app.es_url)?;
+    app.datastreams = datastreams;
+
+    let next_selected = if let Some(name) = selected_name {
+        app.datastreams.iter().position(|entry| entry.name == name)
+    } else {
+        None
+    };
+    if app.datastreams.is_empty() {
+        app.datastreams_state.select(None);
+    } else if let Some(idx) = next_selected {
+        app.datastreams_state.select(Some(idx));
+    } else {
+        app.datastreams_state.select(Some(0));
+    }
+    Ok(())
+}
+
 fn refresh_docs(app: &mut App) -> Result<()> {
-    let Some(index) = app.selected_index_name().map(|name| name.to_string()) else {
+    let Some(scope) = app.selected_scope_name().map(|name| name.to_string()) else {
         app.documents.clear();
         app.docs_total = None;
+        app.search_took_ms = None;
+        app.search_shards_failed = None;
+        app.search_timed_out = None;
         app.docs_state.select(None);
         return Ok(());
     };
-    let (docs, total) = fetch_documents(
+    let (docs, summary) = fetch_documents(
         &app.client,
         &app.es_url,
-        &index,
+        &scope,
         app.docs_from,
         app.docs_size,
         &app.query,
     )?;
     app.documents = docs;
-    app.docs_total = total;
+    app.docs_total = summary.total;
+    app.search_took_ms = summary.took;
+    app.search_shards_failed = summary.shards_failed;
+    app.search_timed_out = summary.timed_out;
     if app.documents.is_empty() {
         app.docs_state.select(None);
     } else {
@@ -413,10 +689,7 @@ fn handle_docs_refresh(app: &mut App) {
     }
 }
 
-fn handle_index_change(app: &mut App) {
-    if let Err(err) = refresh_index_details(app) {
-        app.last_error = Some(format!("details: {err:#}"));
-    }
+fn handle_scope_change(app: &mut App) {
     handle_docs_refresh(app);
 }
 
@@ -446,6 +719,35 @@ fn fetch_indices(client: &reqwest::blocking::Client, es_url: &str) -> Result<Vec
     Ok(indices)
 }
 
+fn fetch_aliases(client: &reqwest::blocking::Client, es_url: &str) -> Result<Vec<AliasEntry>> {
+    let base = es_url.trim_end_matches('/');
+    let url = format!("{base}/_cat/aliases?format=json");
+    let response = client
+        .get(url)
+        .send()
+        .context("request failed")?
+        .error_for_status()
+        .context("http error")?;
+    let aliases: Vec<AliasEntry> = response.json().context("invalid response json")?;
+    Ok(aliases)
+}
+
+fn fetch_datastreams(
+    client: &reqwest::blocking::Client,
+    es_url: &str,
+) -> Result<Vec<DataStreamEntry>> {
+    let base = es_url.trim_end_matches('/');
+    let url = format!("{base}/_data_stream");
+    let response = client
+        .get(url)
+        .send()
+        .context("request failed")?
+        .error_for_status()
+        .context("http error")?;
+    let payload: DataStreamResponse = response.json().context("invalid response json")?;
+    Ok(payload.data_streams)
+}
+
 fn fetch_documents(
     client: &reqwest::blocking::Client,
     es_url: &str,
@@ -453,7 +755,7 @@ fn fetch_documents(
     from: u64,
     size: u64,
     query: &str,
-) -> Result<(Vec<DocEntry>, Option<u64>)> {
+) -> Result<(Vec<DocEntry>, SearchSummary)> {
     let base = es_url.trim_end_matches('/');
     let url = format!("{base}/{index}/_search?from={from}&size={size}");
     let query = query.trim();
@@ -478,6 +780,13 @@ fn fetch_documents(
         .context("http error")?;
     let payload: SearchResponse = response.json().context("invalid response json")?;
     let total = payload.hits.total.map(|value| value.value);
+    let shards_failed = payload.shards.map(|shards| shards.failed);
+    let summary = SearchSummary {
+        total,
+        took: payload.took,
+        shards_failed,
+        timed_out: payload.timed_out,
+    };
     let docs = payload
         .hits
         .hits
@@ -487,281 +796,586 @@ fn fetch_documents(
             source: hit.source,
         })
         .collect();
-    Ok((docs, total))
+    Ok((docs, summary))
 }
 
-fn refresh_index_details(app: &mut App) -> Result<()> {
-    let Some(index) = app.selected_index_name() else {
-        app.index_details = None;
-        return Ok(());
-    };
-    let details = fetch_index_details(&app.client, &app.es_url, index)?;
-    app.index_details = Some(details);
-    Ok(())
-}
-
-fn fetch_index_details(
-    client: &reqwest::blocking::Client,
-    es_url: &str,
-    index: &str,
-) -> Result<IndexDetails> {
-    let base = es_url.trim_end_matches('/');
-    let url = format!(
-        "{base}/{index}?filter_path=*.settings.index.number_of_shards,*.settings.index.number_of_replicas,*.settings.index.uuid"
-    );
-    let response = client
-        .get(url)
-        .send()
-        .context("request failed")?
-        .error_for_status()
-        .context("http error")?;
-    let payload: Value = response.json().context("invalid response json")?;
-
-    let obj = payload
-        .as_object()
-        .context("invalid index details response")?;
-    let entry = obj
-        .get(index)
-        .context("index not found in details response")?;
-    let settings = entry
-        .get("settings")
-        .and_then(|value| value.get("index"))
-        .and_then(|value| value.as_object())
-        .context("missing index settings")?;
-
-    let uuid = settings.get("uuid").and_then(value_to_string);
-    let shards = settings.get("number_of_shards").and_then(value_to_string);
-    let replicas = settings.get("number_of_replicas").and_then(value_to_string);
-
-    Ok(IndexDetails {
-        name: index.to_string(),
-        uuid,
-        shards,
-        replicas,
-    })
-}
-
-fn value_to_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Number(number) => Some(number.to_string()),
-        Value::Bool(value) => Some(value.to_string()),
-        _ => None,
-    }
-}
 
 fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(3),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(frame.size());
 
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "Elasticsearch TUI",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("URL: {}", app.es_url),
-            Style::default().fg(Color::Gray),
-        ),
-    ]))
-    .block(Block::default().borders(Borders::ALL).title("Status"));
-    frame.render_widget(header, chunks[0]);
+    render_top_bar(frame, chunks[0], app);
 
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
         .split(chunks[1]);
 
-    let indices_items: Vec<ListItem> = if app.indices.is_empty() {
-        vec![ListItem::new(Line::from("No indices"))]
+    render_left_nav(frame, body_chunks[0], app);
+    render_right_main(frame, body_chunks[1], app);
+
+    if app.show_doc_drawer {
+        render_doc_drawer(frame, chunks[0].height, app);
+    }
+}
+
+fn render_top_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let label_style = Style::default().fg(Color::Gray);
+    let cluster_name = app
+        .health
+        .as_ref()
+        .map(|health| health.cluster_name.as_str())
+        .unwrap_or("-");
+    let cluster_style = app
+        .health
+        .as_ref()
+        .map(|health| status_style(&health.status))
+        .unwrap_or_else(|| Style::default().fg(Color::Gray));
+    let auth = auth_label(&app.es_url);
+    let scope = scope_label(app);
+    let mode = "QueryString";
+    let (status_text, status_style) = status_summary(app);
+
+    let mut spans = Vec::new();
+    spans.push(Span::styled("cluster:", label_style));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(cluster_name, cluster_style));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("auth:", label_style));
+    spans.push(Span::raw(" "));
+    spans.push(Span::raw(auth));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("scope:", label_style));
+    spans.push(Span::raw(" "));
+    spans.push(Span::raw(scope));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("mode:", label_style));
+    spans.push(Span::raw(" "));
+    spans.push(Span::raw(mode));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(status_text, status_style));
+
+    let header = Paragraph::new(Line::from(spans))
+        .block(Block::default().borders(Borders::ALL).title("TopBar"));
+    frame.render_widget(header, area);
+}
+
+fn render_left_nav(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(7),
+            Constraint::Length(5),
+            Constraint::Length(7),
+        ])
+        .split(area);
+
+    let tabs = Tabs::new(vec![
+        Line::from("Indices"),
+        Line::from("Aliases"),
+        Line::from("DataStreams"),
+    ])
+    .select(scope_tab_index(app.scope_kind))
+    .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+    .block(Block::default().borders(Borders::ALL).title("Scope"));
+    frame.render_widget(tabs, chunks[0]);
+
+    let filter_text = match app.input_mode {
+        InputMode::ScopeFilter => app.scope_filter_edit.as_str(),
+        _ => app.scope_filter.as_str(),
+    };
+    let filter_line = Line::from(vec![
+        Span::styled("Filter", Style::default().fg(Color::Gray)),
+        Span::raw(": "),
+        Span::raw(if filter_text.is_empty() { "-" } else { filter_text }),
+    ]);
+    let filter_block =
+        Paragraph::new(filter_line).block(Block::default().borders(Borders::ALL).title("Search"));
+    frame.render_widget(filter_block, chunks[1]);
+
+    let (scope_items, mut scope_state) = build_scope_items(app);
+    let scope_list = List::new(scope_items)
+        .block(Block::default().borders(Borders::ALL).title(scope_title(app.scope_kind)))
+        .highlight_style(list_focus_style(app.focus == Focus::LeftNav))
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(scope_list, chunks[2], &mut scope_state);
+
+    let favorites_items: Vec<ListItem> = if app.favorites.is_empty() {
+        vec![ListItem::new(Line::from("No favorites"))]
     } else {
-        app.indices
+        app.favorites
             .iter()
-            .map(|entry| {
-                let status = match entry.health.as_str() {
-                    "green" => Span::styled("green", Style::default().fg(Color::Green)),
-                    "yellow" => Span::styled("yellow", Style::default().fg(Color::Yellow)),
-                    "red" => Span::styled("red", Style::default().fg(Color::Red)),
-                    _ => Span::styled(entry.health.as_str(), Style::default().fg(Color::Gray)),
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(&entry.name, Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(" "),
-                    status,
-                    Span::raw(format!(" {}", entry.status)),
-                    Span::raw(format!(" docs={}", entry.docs_count)),
-                ]))
+            .map(|name| ListItem::new(Line::from(name.as_str())))
+            .collect()
+    };
+    let favorites = List::new(favorites_items)
+        .block(Block::default().borders(Borders::ALL).title("Favorites"));
+    frame.render_widget(favorites, chunks[3]);
+
+    let saved_view_items: Vec<ListItem> = if app.saved_views.is_empty() {
+        vec![ListItem::new(Line::from("No saved views"))]
+    } else {
+        app.saved_views
+            .iter()
+            .map(|view| {
+                let summary = format!("{}  {}  {}", view.name, view.scope, view.query);
+                ListItem::new(Line::from(truncate_string(&summary, 60)))
             })
             .collect()
     };
+    let saved_views = List::new(saved_view_items)
+        .block(Block::default().borders(Borders::ALL).title("Saved Views"));
+    frame.render_widget(saved_views, chunks[4]);
+}
 
-    let indices_list = List::new(indices_items)
-        .block(Block::default().borders(Borders::ALL).title("Indices"))
-        .highlight_style(list_focus_style(app.focus == Focus::Indices))
-        .highlight_symbol("> ");
-    frame.render_stateful_widget(indices_list, body_chunks[0], &mut app.indices_state);
-
-    let right_chunks = Layout::default()
+fn render_right_main(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(10),
-            Constraint::Min(5),
-            Constraint::Length(7),
-        ])
-        .split(body_chunks[1]);
+        .constraints([Constraint::Length(5), Constraint::Min(0)])
+        .split(area);
 
-    let mut info_lines: Vec<Line> = Vec::new();
-    if let Some(health) = &app.health {
-        let status_style = status_style(&health.status);
-        info_lines.push(Line::from(vec![
-            Span::raw("Cluster: "),
-            Span::styled(
-                &health.cluster_name,
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        info_lines.push(Line::from(vec![
-            Span::raw("Status : "),
-            Span::styled(health.status.clone(), status_style),
-        ]));
-        info_lines.push(Line::from(format!("Nodes  : {}", health.number_of_nodes)));
-        info_lines.push(Line::from(format!(
-            "Shards : primary={} total={} unassigned={}",
-            health.active_primary_shards, health.active_shards, health.unassigned_shards
-        )));
-    } else {
-        info_lines.push(Line::from("No data yet. Press r to refresh."));
-    }
+    let query_line = query_line(app);
+    let filter_line = filter_chips_line(app);
+    let results_line = results_summary_line(app);
+    let query_block = Paragraph::new(vec![query_line, filter_line, results_line])
+        .block(Block::default().borders(Borders::ALL).title("Query"));
+    frame.render_widget(query_block, chunks[0]);
 
-    if let Some(last_fetch) = app.last_fetch {
-        info_lines.push(Line::from(format!(
-            "Last refresh: {}s ago",
-            last_fetch.elapsed().as_secs()
-        )));
-    } else {
-        info_lines.push(Line::from("Last refresh: never"));
-    }
+    let title = results_title(app.docs_from, app.docs_size, app.docs_total);
+    let id_width = result_id_width(chunks[1].width);
+    let summary_width = chunks[1].width.saturating_sub(id_width + 5);
 
-    if let Some(err) = &app.last_error {
-        info_lines.push(Line::from(vec![
-            Span::styled("Error: ", Style::default().fg(Color::Red)),
-            Span::raw(err),
-        ]));
-    }
-
-    if let Some(details) = &app.index_details {
-        info_lines.push(Line::from(vec![
-            Span::raw("Index : "),
-            Span::styled(&details.name, Style::default().add_modifier(Modifier::BOLD)),
-        ]));
-        info_lines.push(Line::from(format!(
-            "Shards: {}",
-            details.shards.as_deref().unwrap_or("-")
-        )));
-        info_lines.push(Line::from(format!(
-            "Replicas: {}",
-            details.replicas.as_deref().unwrap_or("-")
-        )));
-        info_lines.push(Line::from(format!(
-            "UUID: {}",
-            details.uuid.as_deref().unwrap_or("-")
-        )));
-    }
-
-    let query_text = match app.input_mode {
-        InputMode::Query => format!("Query*: {}", app.query_edit),
-        InputMode::Normal => format!("Query : {}", app.query),
-    };
-    info_lines.push(Line::from(vec![
-        Span::styled("Filter", Style::default().fg(Color::Gray)),
-        Span::raw(" "),
-        Span::raw(query_text),
-        Span::raw(" (press / or ?)"),
-    ]));
-
-    let info_block = Paragraph::new(info_lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Cluster / Index"),
-    );
-    frame.render_widget(info_block, right_chunks[0]);
-
-    let docs_title = docs_title(app.docs_from, app.docs_size, app.docs_total);
-    let docs_items: Vec<ListItem> = if app.documents.is_empty() {
-        vec![ListItem::new(Line::from("No documents"))]
+    let rows: Vec<Row> = if app.documents.is_empty() {
+        vec![Row::new(vec![Cell::from("No documents"), Cell::from("")])]
     } else {
         app.documents
             .iter()
-            .map(|doc| ListItem::new(Line::from(doc_summary(doc))))
+            .map(|doc| {
+                let id = truncate_string(&doc.id, id_width as usize);
+                let preview = doc_summary(doc, summary_width as usize);
+                Row::new(vec![Cell::from(id), Cell::from(preview)])
+            })
             .collect()
     };
-    let docs_block = List::new(docs_items)
-        .block(Block::default().borders(Borders::ALL).title(docs_title))
-        .highlight_style(list_focus_style(app.focus == Focus::Docs))
-        .highlight_symbol("> ");
-    frame.render_stateful_widget(docs_block, right_chunks[1], &mut app.docs_state);
-
-    let mut detail_lines = Vec::new();
-    if let Some(idx) = app.docs_state.selected() {
-        if let Some(doc) = app.documents.get(idx) {
-            detail_lines.push(Line::from(vec![
-                Span::styled("ID: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(&doc.id),
-            ]));
-            let pretty = serde_json::to_string_pretty(&doc.source)
-                .unwrap_or_else(|_| "<invalid json>".to_string());
-            for line in pretty.lines() {
-                detail_lines.push(Line::from(line.to_string()));
-            }
-        }
-    } else {
-        detail_lines.push(Line::from("Select a document to preview"));
-    }
-
-    let detail_block =
-        Paragraph::new(detail_lines).block(Block::default().borders(Borders::ALL).title("Doc"));
-    frame.render_widget(detail_block, right_chunks[2]);
-
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(": quit  "),
-        Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(": refresh  "),
-        Span::styled("↑/↓", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(": select  "),
-        Span::styled("d/Enter", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(": load docs  "),
-        Span::styled("n/p", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(": page  "),
-        Span::styled("/ or ?", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(": filter  "),
-        Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(": focus"),
-    ]))
-    .block(Block::default().borders(Borders::ALL).title("Keys"));
-    frame.render_widget(footer, chunks[2]);
+    let header = Row::new(vec![Cell::from("id"), Cell::from("preview")])
+        .style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD));
+    let table = Table::new(rows, [Constraint::Length(id_width), Constraint::Min(10)])
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(list_focus_style(app.focus == Focus::Results));
+    frame.render_stateful_widget(table, chunks[1], &mut app.docs_state);
 }
 
-fn docs_title(from: u64, size: u64, total: Option<u64>) -> String {
+fn render_doc_drawer(frame: &mut ratatui::Frame, top_offset: u16, app: &App) {
+    let size = frame.size();
+    let height = size.height.saturating_sub(top_offset);
+    if height < 5 {
+        return;
+    }
+    let drawer_width = drawer_width(size.width);
+    let drawer_area = Rect {
+        x: size.width.saturating_sub(drawer_width),
+        y: top_offset,
+        width: drawer_width,
+        height,
+    };
+    frame.render_widget(Clear, drawer_area);
+    let lines = doc_drawer_lines(app, drawer_area.height.saturating_sub(2) as usize);
+    let drawer = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Doc"));
+    frame.render_widget(drawer, drawer_area);
+}
+
+fn scope_tab_index(scope: ScopeKind) -> usize {
+    match scope {
+        ScopeKind::Indices => 0,
+        ScopeKind::Aliases => 1,
+        ScopeKind::DataStreams => 2,
+    }
+}
+
+fn scope_title(scope: ScopeKind) -> &'static str {
+    match scope {
+        ScopeKind::Indices => "Indices",
+        ScopeKind::Aliases => "Aliases",
+        ScopeKind::DataStreams => "DataStreams",
+    }
+}
+
+fn query_line<'a>(app: &'a App) -> Line<'a> {
+    let label_style = Style::default().fg(Color::Gray);
+    let value = match app.input_mode {
+        InputMode::Query => app.query_edit.as_str(),
+        _ => app.query.as_str(),
+    };
+    let value = if value.is_empty() { "-" } else { value };
+    let suffix = if app.input_mode == InputMode::Query {
+        "*"
+    } else {
+        ""
+    };
+    Line::from(vec![
+        Span::styled(format!("Query{suffix}"), label_style),
+        Span::raw(": "),
+        Span::raw(value),
+    ])
+}
+
+fn filter_chips_line<'a>(app: &'a App) -> Line<'a> {
+    let label_style = Style::default().fg(Color::Gray);
+    let mut spans = vec![Span::styled("Filters", label_style), Span::raw(": ")];
+    if app.query.trim().is_empty() {
+        spans.push(Span::raw("(none)"));
+    } else {
+        let chip = truncate_string(app.query.trim(), 40);
+        spans.push(Span::styled(
+            format!(" {} ", chip),
+            Style::default().bg(Color::DarkGray).fg(Color::Black),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn results_summary_line<'a>(app: &'a App) -> Line<'a> {
+    let label_style = Style::default().fg(Color::Gray);
+    let hits = app
+        .docs_total
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let took = app
+        .search_took_ms
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "-".to_string());
+    let failed = app.search_shards_failed.unwrap_or(0);
+    let timed_out = app.search_timed_out.unwrap_or(false);
+    let mut parts = vec![format!("hits {hits}"), format!("took {took}")];
+    if failed > 0 {
+        parts.push(format!("shard_fail {failed}"));
+    }
+    if timed_out {
+        parts.push("timeout".to_string());
+    }
+    let status = parts.join(" | ");
+    let mut spans = vec![Span::styled("Results", label_style), Span::raw(": ")];
+    let status_style = if failed > 0 || timed_out {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    spans.push(Span::styled(status, status_style));
+    Line::from(spans)
+}
+
+fn results_title(from: u64, size: u64, total: Option<u64>) -> String {
     if let Some(total) = total {
         if total == 0 {
-            return "Documents (0)".to_string();
+            return "Results (0)".to_string();
         }
         let page = from / size + 1;
         let pages = (total + size - 1) / size;
-        format!("Documents (page {page}/{pages}, total {total})")
+        format!("Results (page {page}/{pages}, total {total})")
     } else {
-        format!("Documents (from {from}, size {size})")
+        format!("Results (from {from}, size {size})")
     }
+}
+
+fn result_id_width(total_width: u16) -> u16 {
+    let min = 12;
+    let max = 28;
+    let target = total_width / 3;
+    target.clamp(min, max)
+}
+
+fn doc_drawer_lines(app: &App, max_lines: usize) -> Vec<Line<'_>> {
+    let mut lines = Vec::new();
+    let Some(idx) = app.docs_state.selected() else {
+        return vec![Line::from("No document selected")];
+    };
+    let Some(doc) = app.documents.get(idx) else {
+        return vec![Line::from("No document selected")];
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("ID: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(&doc.id),
+    ]));
+    lines.push(doc_view_line(app.doc_view_mode));
+    lines.push(Line::from(vec![
+        Span::styled("Actions", Style::default().fg(Color::Gray)),
+        Span::raw(": include  exclude  copy  search"),
+    ]));
+    lines.push(Line::from(""));
+    if max_lines > 0 && lines.len() >= max_lines {
+        lines.truncate(max_lines);
+        return lines;
+    }
+
+    let token = highlight_token(&app.query);
+    let body_lines = match app.doc_view_mode {
+        DocViewMode::Pretty => json_lines_pretty(&doc.source),
+        DocViewMode::Raw => json_lines_raw(&doc.source),
+        DocViewMode::Flatten => json_lines_flatten(&doc.source),
+    };
+    let mut truncated = false;
+    for line in body_lines {
+        if lines.len() >= max_lines {
+            truncated = true;
+            break;
+        }
+        if let Some(ref token) = token {
+            lines.push(highlight_line(&line, token));
+        } else {
+            lines.push(Line::from(line));
+        }
+    }
+
+    if truncated && max_lines > 0 {
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            *last = Line::from("...");
+        }
+    }
+    lines
+}
+
+fn doc_view_line(mode: DocViewMode) -> Line<'static> {
+    let active = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let inactive = Style::default().fg(Color::Gray);
+    let pretty = if mode == DocViewMode::Pretty {
+        active
+    } else {
+        inactive
+    };
+    let raw = if mode == DocViewMode::Raw {
+        active
+    } else {
+        inactive
+    };
+    let flat = if mode == DocViewMode::Flatten {
+        active
+    } else {
+        inactive
+    };
+    Line::from(vec![
+        Span::styled("View: ", Style::default().fg(Color::Gray)),
+        Span::styled("Pretty", pretty),
+        Span::raw(" | "),
+        Span::styled("Raw", raw),
+        Span::raw(" | "),
+        Span::styled("Flatten", flat),
+    ])
+}
+
+fn json_lines_pretty(value: &Value) -> Vec<String> {
+    serde_json::to_string_pretty(value)
+        .unwrap_or_else(|_| "<invalid json>".to_string())
+        .lines()
+        .map(|line| line.to_string())
+        .collect()
+}
+
+fn json_lines_raw(value: &Value) -> Vec<String> {
+    vec![serde_json::to_string(value).unwrap_or_else(|_| "<invalid json>".to_string())]
+}
+
+fn json_lines_flatten(value: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    flatten_json_value(value, "", &mut out);
+    if out.is_empty() {
+        out.push("<empty>".to_string());
+    }
+    out
+}
+
+fn flatten_json_value(value: &Value, prefix: &str, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                let next = if prefix.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                flatten_json_value(value, &next, out);
+            }
+        }
+        Value::Array(values) => {
+            for (idx, value) in values.iter().enumerate() {
+                let next = format!("{prefix}[{idx}]");
+                flatten_json_value(value, &next, out);
+            }
+        }
+        _ => {
+            let label = if prefix.is_empty() { "<root>" } else { prefix };
+            out.push(format!("{label} = {}", json_value_inline(value)));
+        }
+    }
+}
+
+fn json_value_inline(value: &Value) -> String {
+    match value {
+        Value::String(text) => format!("\"{text}\""),
+        Value::Number(num) => num.to_string(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Null => "null".to_string(),
+        _ => "<complex>".to_string(),
+    }
+}
+
+fn highlight_token(query: &str) -> Option<String> {
+    let token = query
+        .split_whitespace()
+        .find(|part| !part.is_empty())
+        .map(|part| part.trim_matches('"').trim_matches('\'').to_string());
+    token.filter(|value| !value.is_empty())
+}
+
+fn highlight_line(line: &str, token: &str) -> Line<'static> {
+    if token.is_empty() || !line.contains(token) {
+        return Line::from(line.to_string());
+    }
+    let mut spans = Vec::new();
+    let mut rest = line;
+    while let Some(pos) = rest.find(token) {
+        let (before, after) = rest.split_at(pos);
+        if !before.is_empty() {
+            spans.push(Span::raw(before.to_string()));
+        }
+        spans.push(Span::styled(
+            token.to_string(),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        rest = &after[token.len()..];
+    }
+    if !rest.is_empty() {
+        spans.push(Span::raw(rest.to_string()));
+    }
+    Line::from(spans)
+}
+
+fn build_scope_items(app: &App) -> (Vec<ListItem<'_>>, ListState) {
+    let filtered = app.filtered_scope_indices();
+    let mut state = ListState::default();
+    let selected = app.scope_selected();
+    let selected_pos = selected.and_then(|idx| filtered.iter().position(|value| *value == idx));
+    state.select(selected_pos);
+
+    let items: Vec<ListItem> = if filtered.is_empty() {
+        vec![ListItem::new(Line::from("No items"))]
+    } else {
+        filtered
+            .iter()
+            .map(|idx| match app.scope_kind {
+                ScopeKind::Indices => scope_line_index(&app.indices[*idx]),
+                ScopeKind::Aliases => scope_line_alias(&app.aliases[*idx]),
+                ScopeKind::DataStreams => scope_line_datastream(&app.datastreams[*idx]),
+            })
+            .collect()
+    };
+    (items, state)
+}
+
+fn scope_line_index(entry: &IndexEntry) -> ListItem<'_> {
+    let status = match entry.health.as_str() {
+        "green" => Span::styled("green", Style::default().fg(Color::Green)),
+        "yellow" => Span::styled("yellow", Style::default().fg(Color::Yellow)),
+        "red" => Span::styled("red", Style::default().fg(Color::Red)),
+        _ => Span::styled(entry.health.as_str(), Style::default().fg(Color::Gray)),
+    };
+    ListItem::new(Line::from(vec![
+        Span::styled(&entry.name, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        status,
+        Span::raw(format!(" docs={}", entry.docs_count)),
+    ]))
+}
+
+fn scope_line_alias(entry: &AliasEntry) -> ListItem<'_> {
+    ListItem::new(Line::from(vec![
+        Span::styled(&entry.alias, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" -> "),
+        Span::raw(&entry.index_name),
+    ]))
+}
+
+fn scope_line_datastream(entry: &DataStreamEntry) -> ListItem<'_> {
+    let status = entry.status.as_deref().unwrap_or("-");
+    let status_span = match status.to_lowercase().as_str() {
+        "green" => Span::styled(status, Style::default().fg(Color::Green)),
+        "yellow" => Span::styled(status, Style::default().fg(Color::Yellow)),
+        "red" => Span::styled(status, Style::default().fg(Color::Red)),
+        _ => Span::styled(status, Style::default().fg(Color::Gray)),
+    };
+    let backing = entry
+        .indices
+        .as_ref()
+        .map(|values| values.len())
+        .unwrap_or(0);
+    let generation = entry
+        .generation
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    ListItem::new(Line::from(vec![
+        Span::styled(&entry.name, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        status_span,
+        Span::raw(format!(" gen={generation} backing={backing}")),
+    ]))
+}
+
+fn auth_label(es_url: &str) -> &'static str {
+    if es_url.contains('@') {
+        "basic"
+    } else {
+        "none"
+    }
+}
+
+fn scope_label(app: &App) -> String {
+    let kind = match app.scope_kind {
+        ScopeKind::Indices => "index",
+        ScopeKind::Aliases => "alias",
+        ScopeKind::DataStreams => "datastream",
+    };
+    let name = app.selected_scope_name().unwrap_or("-");
+    format!("{kind}/{name}")
+}
+
+fn status_summary(app: &App) -> (String, Style) {
+    let hits = app
+        .docs_total
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let took = app
+        .search_took_ms
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "-".to_string());
+    let failed = app.search_shards_failed.unwrap_or(0);
+    let timed_out = app.search_timed_out.unwrap_or(false);
+    let mut parts = vec![format!("hits {hits}"), format!("took {took}")];
+    if failed > 0 {
+        parts.push(format!("shard_fail {failed}"));
+    }
+    if timed_out {
+        parts.push("timeout".to_string());
+    }
+    if app.last_error.is_some() {
+        parts.push("error".to_string());
+    }
+    let text = format!("status: {}", parts.join(" | "));
+    let style = if failed > 0 || timed_out || app.last_error.is_some() {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    (text, style)
 }
 
 fn list_focus_style(active: bool) -> Style {
@@ -775,10 +1389,37 @@ fn list_focus_style(active: bool) -> Style {
     }
 }
 
-fn doc_summary(doc: &DocEntry) -> String {
+fn doc_summary(doc: &DocEntry, max_len: usize) -> String {
     let source = serde_json::to_string(&doc.source).unwrap_or_else(|_| "<invalid>".into());
-    let truncated = truncate_string(&source, 80);
-    format!("{} {}", doc.id, truncated)
+    truncate_string(&source, max_len)
+}
+
+fn filter_indices_by<T, F>(items: &[T], needle: &str, extract: F) -> Vec<usize>
+where
+    F: Fn(&T) -> &str,
+{
+    if needle.is_empty() {
+        return (0..items.len()).collect();
+    }
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            let hay = extract(entry).to_lowercase();
+            if hay.contains(needle) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn drawer_width(total_width: u16) -> u16 {
+    let min = 30;
+    let max = total_width.saturating_sub(2).max(min);
+    let target = total_width.saturating_mul(55) / 100;
+    target.clamp(min, max)
 }
 
 fn truncate_string(value: &str, max_len: usize) -> String {
